@@ -1,63 +1,82 @@
-import unittest
-from unittest.mock import patch, MagicMock
+import asyncio
+from unittest.mock import patch, AsyncMock
+import pytest
 
-from Script.BinanceExport import download_binance_futures_data, load_config
+from Script.BinanceExport import create_pool, download_binance_futures_data, process_symbol, load_config
 
-
-class TestDownloadBinanceFuturesData(unittest.TestCase):
-
-    @patch('Script.BinanceExport.connect_postgres')
-    @patch('Script.BinanceExport.ccxt.binance', create=True)
-    def test_download_data(self, mock_binance, mock_connect):
-        # Setup
-        db_params = {
-            "host": "localhost",
-            "database": "test_db",
-            "user": "user",
-            "password": "pass"
+@pytest.fixture
+def binance_market():
+    return {
+        'BTC/USDT': {
+            'info': {'contractType': 'PERPETUAL'},
+            'limits': {},
+            'precision': {}
+        },
+        'ETH/USDT': {
+            'info': {'contractType': 'PERPETUAL'},
+            'limits': {},
+            'precision': {}
         }
-        mock_conn = MagicMock()
-        mock_cursor = MagicMock()
-        mock_connect.return_value = mock_conn
-        mock_conn.cursor.return_value = mock_cursor
-        mock_cursor.fetchone.return_value = (None,)
+    }
 
-        mock_binance_instance = MagicMock()
-        mock_binance.return_value = mock_binance_instance
-        mock_binance_instance.load_markets.return_value = True
-        mock_binance_instance.markets = {
-            'BTC/USD': {'info': {'contractType': 'PERPETUAL'}}
-        }
+@pytest.fixture
+def db_params():
+    return {
+        'host': 'localhost',
+        'database': 'test_db',
+        'user': 'user',
+        'password': 'password'
+    }
 
-        symbol_data = [
-            (1609459200000, 29000, 29100, 28900, 29050, 100),
-            (1609459260000, 29050, 29150, 29000, 29100, 150)
-        ]
+@pytest.fixture
+async def pool(mocker):
+    mock_pool = AsyncMock()
+    mocker.patch('asyncpg.create_pool', return_value=mock_pool)
+    return mock_pool
 
-        mock_binance_instance.fetch_ohlcv.return_value = symbol_data
+@pytest.mark.asyncio
+async def test_create_pool(db_params):
+    with patch('asyncpg.create_pool', AsyncMock()) as mocked_pool:
+        pool = await create_pool(**db_params)
+        assert mocked_pool.called
+        mocked_pool.assert_called_with(host='localhost', database='test_db', user='user', password='password', command_timeout=60)
 
-        # Act
-        download_binance_futures_data('future', db_params, 'BTC/USD')
+@pytest.mark.asyncio
+async def test_download_binance_futures_data(mocker, binance_market, db_params, pool):
+    mock_binance = AsyncMock()
+    mock_binance.load_markets.return_value = None
+    mock_binance.markets = binance_market
 
-        # Assert
-        mock_binance_instance.fetch_ohlcv.assert_called_with('BTC/USD', timeframe='1m', since=0, limit=1500)
+    mocker.patch('ccxt.async_support.binance', return_value=mock_binance)
 
+    with patch('data_downloader.process_symbol', new_callable=AsyncMock) as mock_process_symbol:
+        await download_binance_futures_data('future', db_params, 'BTC/USDT,ETH/USDT')
+        assert mock_process_symbol.call_count == 2
 
-    def test_load_config(self):
-        with patch('Script.BinanceExport.ConfigParser') as mock_config_parser:
-            mock_parser_instance = MagicMock()
-            mock_config_parser.return_value = mock_parser_instance
-            mock_parser_instance.read.return_value = True
-            mock_parser_instance.has_section.return_value = True
-            mock_parser_instance.items.return_value = [('host', 'localhost'), ('database', 'test_db'), ('user', 'user'), ('password', 'pass')]
+@pytest.mark.asyncio
+async def test_process_symbol(mocker, pool):
+    symbol = 'BTC/USDT'
+    mock_binance = AsyncMock()
+    mock_binance.market.return_value = binance_market['BTC/USDT']
 
-            params = load_config('database.ini', 'postgresql')
-            self.assertEqual(params['host'], 'localhost')
-            self.assertEqual(params['database'], 'test_db')
-            self.assertEqual(params['user'], 'user')
-            self.assertEqual(params['password'], 'pass')
-            mock_parser_instance.read.assert_called_with('database.ini')
-            mock_parser_instance.has_section.assert_called_with('postgresql')
+    mock_conn = mocker.MagicMock()
+    pool.acquire.return_value.__aenter__.return_value = mock_conn
 
-if __name__ == '__main__':
-    unittest.main()
+    ohlcv_data = [
+        [1609459200000, 29000, 29500, 28900, 29400, 100],  # timestamp, open, high, low, close, volume
+        [1609459260000, 29400, 29600, 29300, 29500, 150]
+    ]
+
+    mock_binance.fetch_ohlcv.return_value = ohlcv_data
+
+    await process_symbol(symbol, mock_binance, pool)
+    mock_conn.executemany.assert_called_once()
+    assert mock_conn.executemany.call_args[0][0] == f'INSERT INTO "BTCUSDT" (timestamp, open, high, low, close, volume) VALUES ($1, $2, $3, $4, $5, $6);'
+    assert mock_conn.executemany.call_args[0][1] == ohlcv_data
+
+def test_load_config():
+    with patch('configparser.ConfigParser.read', return_value=None), \
+         patch('configparser.ConfigParser.has_section', return_value=True), \
+         patch('configparser.ConfigParser.items', return_value=[('host', 'localhost'), ('database', 'test_db')]):
+        config = load_config('database.ini', 'postgresql')
+        assert config == {'host': 'localhost', 'database': 'test_db'}
