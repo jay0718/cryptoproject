@@ -6,7 +6,7 @@ import argparse
 from configparser import ConfigParser
 
 async def create_pool(host, database, user, password):
-    return await asyncpg.create_pool(host=host, database=database, user=user, password=password, command_timeout=60)
+    return await asyncpg.create_pool(host=host, database=database, user=user, password=password, command_timeout=60, min_size=5, max_size=20)
 
 async def download_binance_futures_data(market, db_params, symbols="all"):
     pool = await create_pool(**db_params)
@@ -41,8 +41,9 @@ async def process_symbol(symbol, binance, pool):
         try:
             market_data = binance.market(symbol)
 
+            table_name = symbol.replace("/", "")
             await conn.execute(f"""
-                CREATE TABLE IF NOT EXISTS "{symbol.replace("/", "")}" (
+                CREATE TABLE IF NOT EXISTS "{table_name}" (
                     timestamp BIGINT,
                     open NUMERIC,
                     high NUMERIC,
@@ -52,7 +53,7 @@ async def process_symbol(symbol, binance, pool):
                 );
             """)
 
-            last_timestamp = await conn.fetchval(f"SELECT max(timestamp) FROM \"{symbol.replace('/', '')}\";")
+            last_timestamp = await conn.fetchval(f"SELECT max(timestamp) FROM \"{table_name}\";")
             timestamp = 0 if last_timestamp is None else last_timestamp + 1
 
             downloaded = 0
@@ -62,17 +63,24 @@ async def process_symbol(symbol, binance, pool):
                     break
 
                 await conn.executemany(
-                    f"INSERT INTO \"{symbol.replace('/', '')}\" (timestamp, open, high, low, close, volume) VALUES ($1, $2, $3, $4, $5, $6);",
+                    f"INSERT INTO \"{table_name}\" (timestamp, open, high, low, close, volume) VALUES ($1, $2, $3, $4, $5, $6);",
                     [(x[0], x[1], x[2], x[3], x[4], x[5]) for x in tohlcv]
                 )
 
                 timestamp = tohlcv[-1][0] + 1
                 downloaded += len(tohlcv)
                 print(f"Downloaded {downloaded} rows for {symbol}...")
-        except Exception as e:
-            print(f"An error occurred with {symbol}: {e}")
+                await asyncio.sleep(1)  
 
-def load_config(filename='database.ini', section='postgresql'):
+        except asyncio.CancelledError:
+            print(f"Task for {symbol} was cancelled.")
+        except asyncpg.PostgresError as e:
+            print(f"Database error with {symbol}: {e}")
+        except Exception as e:
+            print(f"An unexpected error occurred with {symbol}: {e}")
+
+
+def load_config(filename='../database.ini', section='postgresql'):
     parser = ConfigParser()
     parser.read(filename)
     db_params = {}

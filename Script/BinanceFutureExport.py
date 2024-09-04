@@ -87,7 +87,7 @@ async def process_symbol(symbol, binance, pool, export_csv):
         except Exception as e:
             print(f"An error occurred with {symbol}: {e}")
 
-def load_config(filename='database.ini', section='postgresql'):
+def load_config(filename='../database.ini', section='postgresql'):
     parser = ConfigParser()
     parser.read(filename)
     db_params = {}
